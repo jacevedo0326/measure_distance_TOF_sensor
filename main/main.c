@@ -16,6 +16,48 @@ volatile uint16_t lower_bound = 0;
 volatile uint16_t upper_bound = 0;
 volatile uint16_t true_upper_bound = 0;
 
+// Global flag for interrupt
+volatile bool start_reading_data = false;
+
+// GPIO interrupt handler
+static void IRAM_ATTR gpio_isr_handler(void* arg) {
+    start_reading_data = !start_reading_data;  // Toggle the flag
+}
+
+// Initialize all interrupts
+static esp_err_t interrupt_init(void) {
+    // Configure GPIO1 for interrupt
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_1),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure GPIO1");
+        return ret;
+    }
+    
+    // Install GPIO ISR service
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install GPIO ISR service");
+        return ret;
+    }
+    
+    // Add interrupt handler for GPIO1
+    ret = gpio_isr_handler_add(GPIO_NUM_1, gpio_isr_handler, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add GPIO1 ISR handler");
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "GPIO1 interrupt configured");
+    return ESP_OK;
+}
+
 // Convert to percentage
 static uint16_t convert_to_percentage(uint16_t data) {
     if (data < lower_bound) {
@@ -101,6 +143,13 @@ void app_main(void) {
         return;
     }
     
+    // Initialize interrupts
+    ret = interrupt_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize interrupts!");
+        return;
+    }
+    
     test_read_write();
     // Initialize I2C for VL53L0X
     i2c_config_t conf = {
@@ -142,10 +191,11 @@ void app_main(void) {
 ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
     // Main measurement loop
     while (1) {
-        uint16_t range = read_range_continuous();
-        uint8_t percentage = convert_to_percentage(range);
-        ESP_LOGI(TAG, "Distance: %d mm, Percentage: %d%%", range, percentage);
-        
+        if(start_reading_data){
+            uint16_t range = read_range_continuous();
+            uint8_t percentage = convert_to_percentage(range);
+            ESP_LOGI(TAG, "Distance: %d mm, Percentage: %d%%", range, percentage);
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

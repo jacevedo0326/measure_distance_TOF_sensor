@@ -51,6 +51,46 @@ static void find_upper_and_lower(void) {
     true_upper_bound = upper_bound - lower_bound;
 }
 
+// Save calibration values to flash
+static void save_calibration_to_flash(uint16_t lower, uint16_t upper) {
+    uint8_t calib_data[4];
+    
+    // Pack the 16-bit values into bytes
+    calib_data[0] = lower & 0xFF;           // Lower bound LSB
+    calib_data[1] = (lower >> 8) & 0xFF;    // Lower bound MSB
+    calib_data[2] = upper & 0xFF;           // Upper bound LSB
+    calib_data[3] = (upper >> 8) & 0xFF;    // Upper bound MSB
+    
+    ESP_LOGI(TAG, "Saving calibration to flash - Lower: %d, Upper: %d", lower, upper);
+    
+    // Must erase sector before writing
+    esp_err_t ret = flash_erase_sector(0x2000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to erase sector for calibration");
+        return;
+    }
+    
+    // Write to flash (address 0x2000)
+    ret = flash_write(0x2000, calib_data, 4);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Calibration saved successfully");
+        
+        // Read back to verify
+        uint8_t verify_data[4];
+        if (flash_read(0x2000, verify_data, 4) == ESP_OK) {
+            uint16_t saved_lower = verify_data[0] | (verify_data[1] << 8);
+            uint16_t saved_upper = verify_data[2] | (verify_data[3] << 8);
+            ESP_LOGI(TAG, "Verification - Lower: %d, Upper: %d", saved_lower, saved_upper);
+            
+            if (saved_lower != lower || saved_upper != upper) {
+                ESP_LOGE(TAG, "Verification failed! Data mismatch");
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to save calibration to flash");
+    }
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "VL53L0X with Flash Storage");
     
@@ -61,6 +101,7 @@ void app_main(void) {
         return;
     }
     
+    test_read_write();
     // Initialize I2C for VL53L0X
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -88,23 +129,17 @@ void app_main(void) {
     // Calibrate the sensor
     find_upper_and_lower();
     
-    // Save calibration to flash
-    uint8_t calib_data[4];
-    calib_data[0] = lower_bound & 0xFF;
-    calib_data[1] = (lower_bound >> 8) & 0xFF;
-    calib_data[2] = upper_bound & 0xFF;
-    calib_data[3] = (upper_bound >> 8) & 0xFF;
+    // Save calibration to flash using the new function
+    save_calibration_to_flash(lower_bound, upper_bound);
     
-    ESP_LOGI(TAG, "Saving calibration to flash...");
-    flash_write(0x000000, calib_data, 4);
-    
-    // Read back to verify
-    uint8_t verify_data[4];
-    flash_read(0x000000, verify_data, 4);
-    uint16_t saved_lower = verify_data[0] | (verify_data[1] << 8);
-    uint16_t saved_upper = verify_data[2] | (verify_data[3] << 8);
-    ESP_LOGI(TAG, "Verified - Lower: %d, Upper: %d", saved_lower, saved_upper);
-    
+    uint8_t calib_data[4];  // Array to hold 4 bytes
+    flash_read(0x2000, calib_data, 4);
+
+// Reconstruct the 16-bit values
+    uint16_t saved_lower = calib_data[0] | (calib_data[1] << 8);
+    uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
+
+ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
     // Main measurement loop
     while (1) {
         uint16_t range = read_range_continuous();

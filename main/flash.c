@@ -179,6 +179,7 @@ esp_err_t flash_write(uint32_t address, const uint8_t *data, size_t len) {
 }
 
 // Read data from flash
+// Saves the value to the array data that it is being pointed too
 esp_err_t flash_read(uint32_t address, uint8_t *data, size_t len) {
     spi_transaction_t t = {0};
     uint8_t *tx_buf = malloc(4 + len);
@@ -307,6 +308,20 @@ esp_err_t flash_erase_chip(void) {
     
     return ret;
 }
+
+// Test sequence:
+void test_read_write(void){
+    uint8_t test_write[4] = {0x12, 0x34, 0x56, 0x78};
+    uint8_t test_read[4];
+
+    flash_erase_sector(0x1000);              // MUST ERASE FIRST!
+    flash_write(0x1000, test_write, 4);
+    flash_read(0x1000, test_read, 4);
+
+    ESP_LOGI(TAG, "Read: %02X %02X %02X %02X", 
+            test_read[0], test_read[1], test_read[2], test_read[3]);
+    // Should show: 12 34 56 78
+}    
 
 // Get manufacturer ID
 uint8_t flash_get_manufacturer_id(void) {

@@ -67,6 +67,7 @@ esp_err_t flash_erase_block_32k(uint32_t address);
 esp_err_t flash_erase_block_64k(uint32_t address);
 esp_err_t flash_erase_chip(void);
 uint8_t flash_get_manufacturer_id(void);
+void test_read_write(void);
 bool flash_is_busy(void);
 void flash_wait_busy(void);
 void flash_power_down(void);

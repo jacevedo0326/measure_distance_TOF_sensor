@@ -5,11 +5,15 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "vl53l0x.h"
 #include "flash.h"
 #include "config.h"
 
 static const char *TAG = "MAIN";
+
+// Debounce configuration
+#define DEBOUNCE_TIME_MS 1000
 
 // Global Variables for calibration
 volatile uint16_t lower_bound = 0;
@@ -19,9 +23,30 @@ volatile uint16_t true_upper_bound = 0;
 // Global flag for interrupt
 volatile bool start_reading_data = false;
 
+// Timer handle for debouncing
+static esp_timer_handle_t debounce_timer = NULL;
+
+// Debounce timer callback - re-enables the interrupt
+static void debounce_timer_callback(void* arg) {
+    gpio_intr_enable(GPIO_NUM_1);
+}
+
 // GPIO interrupt handler
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    start_reading_data = !start_reading_data;  // Toggle the flag
+    start_reading_data = !start_reading_data;
+    gpio_intr_disable(GPIO_NUM_1);
+    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+}
+
+// Initialize debounce timer
+static esp_err_t debounce_timer_init(void) {
+    const esp_timer_create_args_t timer_args = {
+        .callback = &debounce_timer_callback,
+        .arg = NULL,
+        .name = "debounce"
+    };
+    
+    return esp_timer_create(&timer_args, &debounce_timer);
 }
 
 // Initialize all interrupts
@@ -30,9 +55,9 @@ static esp_err_t interrupt_init(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << GPIO_NUM_1),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
     };
     esp_err_t ret = gpio_config(&io_conf);
     if (ret != ESP_OK) {
@@ -143,6 +168,13 @@ void app_main(void) {
         return;
     }
     
+    // Initialize debounce timer
+    ret = debounce_timer_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize debounce timer!");
+        return;
+    }
+    
     // Initialize interrupts
     ret = interrupt_init();
     if (ret != ESP_OK) {
@@ -184,11 +216,12 @@ void app_main(void) {
     uint8_t calib_data[4];  // Array to hold 4 bytes
     flash_read(0x2000, calib_data, 4);
 
-// Reconstruct the 16-bit values
+    // Reconstruct the 16-bit values
     uint16_t saved_lower = calib_data[0] | (calib_data[1] << 8);
     uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
 
-ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
+    ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
+    
     // Main measurement loop
     while (1) {
         if(start_reading_data){

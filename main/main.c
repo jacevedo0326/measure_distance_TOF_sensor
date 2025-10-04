@@ -22,6 +22,7 @@ volatile uint16_t true_upper_bound = 0;
 
 // Global flag for interrupt
 volatile bool start_reading_data = false;
+volatile bool calibration_flag = false;
 
 // Timer handle for debouncing
 static esp_timer_handle_t debounce_timer = NULL;
@@ -29,10 +30,11 @@ static esp_timer_handle_t debounce_timer = NULL;
 // Debounce timer callback - re-enables the interrupt
 static void debounce_timer_callback(void* arg) {
     gpio_intr_enable(GPIO_NUM_1);
+    gpio_intr_enable(GPIO_NUM_20);
 }
 
 // GPIO interrupt handler
-static void IRAM_ATTR gpio_isr_handler(void* arg) {
+static void IRAM_ATTR gpio_isr_handler_read_measurements(void* arg) {
     start_reading_data = !start_reading_data;
     gpio_intr_disable(GPIO_NUM_1);
     esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
@@ -48,38 +50,67 @@ static esp_err_t debounce_timer_init(void) {
     
     return esp_timer_create(&timer_args, &debounce_timer);
 }
+static void IRAM_ATTR gpio_isr_handler_start_calibration(void* arg) {
+    calibration_flag = true;
+    gpio_intr_disable(GPIO_NUM_20);
+    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+}
 
-// Initialize all interrupts
+// Init INTR
 static esp_err_t interrupt_init(void) {
     // Configure GPIO1 for interrupt
-    gpio_config_t io_conf = {
+    gpio_config_t io_conf_1 = {
         .pin_bit_mask = (1ULL << GPIO_NUM_1),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_POSEDGE,
     };
-    esp_err_t ret = gpio_config(&io_conf);
+    esp_err_t ret = gpio_config(&io_conf_1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure GPIO1");
         return ret;
     }
     
-    // Install GPIO ISR service
+    ESP_LOGI(TAG, "GPIO1 interrupt configured");
+
+    // Configure GPIO20 for interrupt
+    gpio_config_t io_conf_20 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_20),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    ret = gpio_config(&io_conf_20);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure GPIO20");
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "GPIO20 interrupt configured");
+
+    // **INSTALL ISR SERVICE FIRST** - before adding any handlers
     ret = gpio_install_isr_service(0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install GPIO ISR service");
         return ret;
     }
-    
-    // Add interrupt handler for GPIO1
-    ret = gpio_isr_handler_add(GPIO_NUM_1, gpio_isr_handler, NULL);
+
+    // Now add interrupt handlers
+    ret = gpio_isr_handler_add(GPIO_NUM_1, gpio_isr_handler_read_measurements, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add GPIO1 ISR handler");
         return ret;
     }
-    
-    ESP_LOGI(TAG, "GPIO1 interrupt configured");
+
+    ret = gpio_isr_handler_add(GPIO_NUM_20, gpio_isr_handler_start_calibration, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add GPIO20 ISR handler");
+        return ret;
+    }
+
     return ESP_OK;
 }
 
@@ -207,23 +238,28 @@ void app_main(void) {
     
     vTaskDelay(pdMS_TO_TICKS(200));  // Wait for first measurement
     
-    // Calibrate the sensor
-    find_upper_and_lower();
-    
-    // Save calibration to flash using the new function
-    save_calibration_to_flash(lower_bound, upper_bound);
-    
-    uint8_t calib_data[4];  // Array to hold 4 bytes
-    flash_read(0x2000, calib_data, 4);
 
-    // Reconstruct the 16-bit values
-    uint16_t saved_lower = calib_data[0] | (calib_data[1] << 8);
-    uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
-
-    ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
     
     // Main measurement loop
     while (1) {
+        if(calibration_flag){
+                // Calibrate the sensor
+                find_upper_and_lower();
+                
+                // Save calibration to flash using the new function
+                save_calibration_to_flash(lower_bound, upper_bound);
+                
+                uint8_t calib_data[4];  // Array to hold 4 bytes
+                flash_read(0x2000, calib_data, 4);
+
+                // Reconstruct the 16-bit values
+                uint16_t saved_lower = calib_data[0] | (calib_data[1] << 8);
+                uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
+
+                ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
+                calibration_flag = false;
+                start_reading_data = false;
+            }
         if(start_reading_data){
             uint16_t range = read_range_continuous();
             uint8_t percentage = convert_to_percentage(range);

@@ -29,6 +29,7 @@ volatile uint16_t true_upper_bound = 0;
 volatile bool start_reading_data = false;
 volatile bool calibration_flag = false;
 volatile bool read_measurements_flag = false;
+volatile bool erase_measurements_flag = false;
 
 // Measurement storage
 typedef struct {
@@ -47,6 +48,7 @@ static void debounce_timer_callback(void* arg) {
     gpio_intr_enable(GPIO_NUM_1);
     gpio_intr_enable(GPIO_NUM_20);
     gpio_intr_enable(GPIO_NUM_21);
+    gpio_intr_enable(GPIO_NUM_5);
 }
 
 // GPIO interrupt handler
@@ -75,6 +77,12 @@ static void IRAM_ATTR gpio_isr_handler_start_calibration(void* arg) {
 static void IRAM_ATTR gpio_isr_handler_read_flash_measurements(void* arg) {
     read_measurements_flag = true;
     gpio_intr_disable(GPIO_NUM_21);
+    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+}
+
+static void IRAM_ATTR gpio_isr_handler_erase_measurements(void* arg) {
+    erase_measurements_flag = true;
+    gpio_intr_disable(GPIO_NUM_5);
     esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
 }
 
@@ -130,6 +138,23 @@ static esp_err_t interrupt_init(void) {
 
     ESP_LOGI(TAG, "GPIO21 interrupt configured");
 
+    // Configure GPIO5 for interrupt
+    gpio_config_t io_conf_5 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_5),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    ret = gpio_config(&io_conf_5);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure GPIO5");
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "GPIO5 interrupt configured");
+
     // **INSTALL ISR SERVICE FIRST** - before adding any handlers
     ret = gpio_install_isr_service(0);
     if (ret != ESP_OK) {
@@ -153,6 +178,12 @@ static esp_err_t interrupt_init(void) {
     ret = gpio_isr_handler_add(GPIO_NUM_21, gpio_isr_handler_read_flash_measurements, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add GPIO21 ISR handler");
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add(GPIO_NUM_5, gpio_isr_handler_erase_measurements, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add GPIO5 ISR handler");
         return ret;
     }
 
@@ -289,6 +320,79 @@ static void read_measurements_from_flash(void) {
     ESP_LOGI(TAG, "Finished reading measurements");
 }
 
+// Erase all measurements from flash (keeps calibration data)
+static void erase_measurements_from_flash(void) {
+    ESP_LOGI(TAG, "Erasing all measurements from flash...");
+
+    // Calculate how many sectors we need to erase
+    uint32_t total_bytes = MAX_MEASUREMENTS * sizeof(measurement_t);
+    uint32_t sectors_to_erase = (total_bytes + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE;
+
+    for (uint32_t i = 0; i < sectors_to_erase; i++) {
+        uint32_t sector_addr = MEASUREMENTS_FLASH_ADDR + (i * FLASH_SECTOR_SIZE);
+        esp_err_t ret = flash_erase_sector(sector_addr);
+
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Erased sector at 0x%04lX", sector_addr);
+        } else {
+            ESP_LOGE(TAG, "Failed to erase sector at 0x%04lX", sector_addr);
+        }
+    }
+
+    measurement_count = 0;
+    ESP_LOGI(TAG, "All measurements erased. Measurement count reset to 0");
+}
+
+// Load calibration data from flash on startup
+static void load_calibration_from_flash(void) {
+    uint8_t calib_data[4];
+    esp_err_t ret = flash_read(CALIBRATION_FLASH_ADDR, calib_data, 4);
+
+    if (ret == ESP_OK) {
+        uint16_t saved_lower = calib_data[0] | (calib_data[1] << 8);
+        uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
+
+        // Check if flash contains valid data (not blank/erased)
+        if (saved_lower != 0xFFFF && saved_upper != 0xFFFF && saved_lower < saved_upper) {
+            lower_bound = saved_lower;
+            upper_bound = saved_upper;
+            true_upper_bound = upper_bound - lower_bound;
+            ESP_LOGI(TAG, "Loaded calibration from flash - Lower: %d, Upper: %d", lower_bound, upper_bound);
+        } else {
+            ESP_LOGW(TAG, "No valid calibration found in flash. Please calibrate.");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to read calibration from flash");
+    }
+}
+
+// Count existing measurements in flash on startup
+static void count_measurements_in_flash(void) {
+    measurement_count = 0;
+
+    // Scan through flash to find how many valid measurements exist
+    for (uint32_t i = 0; i < MAX_MEASUREMENTS; i++) {
+        measurement_t meas;
+        uint32_t addr = MEASUREMENTS_FLASH_ADDR + (i * sizeof(measurement_t));
+
+        esp_err_t ret = flash_read(addr, (uint8_t*)&meas, sizeof(measurement_t));
+        if (ret == ESP_OK) {
+            // Check if this is a valid measurement (not blank flash)
+            if (meas.range != 0xFFFF && meas.percentage != 0xFF) {
+                measurement_count = i + 1;
+            } else {
+                // Found blank data, stop counting
+                break;
+            }
+        } else {
+            ESP_LOGE(TAG, "Error reading flash at measurement %lu", i);
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "Found %lu existing measurements in flash", measurement_count);
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "VL53L0X with Flash Storage");
     
@@ -298,7 +402,11 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to initialize flash!");
         return;
     }
-    
+
+    // Load calibration and measurement count from flash
+    load_calibration_from_flash();
+    count_measurements_in_flash();
+
     // Initialize debounce timer
     ret = debounce_timer_init();
     if (ret != ESP_OK) {
@@ -312,8 +420,8 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to initialize interrupts!");
         return;
     }
-    
-    test_read_write();
+
+    // test_read_write();  // Commented out - erases flash on startup
     // Initialize I2C for VL53L0X
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -367,6 +475,11 @@ void app_main(void) {
         if(read_measurements_flag){
             read_measurements_from_flash();
             read_measurements_flag = false;
+        }
+
+        if(erase_measurements_flag){
+            erase_measurements_from_flash();
+            erase_measurements_flag = false;
         }
 
         if(start_reading_data){

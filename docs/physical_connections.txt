@@ -1,0 +1,12 @@
+0--> GPIO1 of sensor
+2--> D0 of flash
+3--> DI of flash
+4--> SLK of flash
+3V--> VCC of both 
+G--> Ground of both
+8--> SDA of sensor
+9--> SCL of sensor
+10--> CS of flash
+
+
+Votlage goes to Xshut

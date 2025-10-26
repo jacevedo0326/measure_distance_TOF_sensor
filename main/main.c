@@ -18,7 +18,8 @@ static const char *TAG = "MAIN";
 // Flash storage configuration
 #define CALIBRATION_FLASH_ADDR 0x2000
 #define MEASUREMENTS_FLASH_ADDR 0x3000
-#define MAX_MEASUREMENTS 500  // Each measurement is 4 bytes (uint16_t range + uint8_t percentage + padding)
+#define FLASH_SIZE_BYTES (8 * 1024 * 1024)  // 64 Mbit = 8 MB
+#define MAX_MEASUREMENTS ((FLASH_SIZE_BYTES - MEASUREMENTS_FLASH_ADDR) / sizeof(measurement_t))  // Use all available flash
 
 // Global Variables for calibration
 volatile uint16_t lower_bound = 0;
@@ -30,6 +31,7 @@ volatile bool start_reading_data = false;
 volatile bool calibration_flag = false;
 volatile bool read_measurements_flag = false;
 volatile bool erase_measurements_flag = false;
+volatile bool download_data_flag = false;
 
 // Measurement storage
 typedef struct {
@@ -43,12 +45,31 @@ static uint32_t measurement_count = 0;
 // Timer handle for debouncing
 static esp_timer_handle_t debounce_timer = NULL;
 
+// Function to log pin assignments
+static void log_pin_assignments(void) {
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "PIN ASSIGNMENT MAP");
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "I2C Pins:");
+    ESP_LOGI(TAG, "  GPIO8  - I2C SDA (VL53L0X Data)");
+    ESP_LOGI(TAG, "  GPIO9  - I2C SCL (VL53L0X Clock)");
+    ESP_LOGI(TAG, "----------------------------------------");
+    ESP_LOGI(TAG, "Control Buttons:");
+    ESP_LOGI(TAG, "  GPIO1  - Start/Stop Measurements");
+    ESP_LOGI(TAG, "  GPIO20 - Start Calibration");
+    ESP_LOGI(TAG, "  GPIO21 - Read Flash Measurements");
+    ESP_LOGI(TAG, "  GPIO5  - Erase Flash Measurements");
+    ESP_LOGI(TAG, "  GPIO6  - Download CSV Data");
+    ESP_LOGI(TAG, "========================================");
+}
+
 // Debounce timer callback - re-enables the interrupt
 static void debounce_timer_callback(void* arg) {
     gpio_intr_enable(GPIO_NUM_1);
     gpio_intr_enable(GPIO_NUM_20);
     gpio_intr_enable(GPIO_NUM_21);
     gpio_intr_enable(GPIO_NUM_5);
+    gpio_intr_enable(GPIO_NUM_6);
 }
 
 // GPIO interrupt handler
@@ -86,6 +107,12 @@ static void IRAM_ATTR gpio_isr_handler_erase_measurements(void* arg) {
     esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
 }
 
+static void IRAM_ATTR gpio_isr_handler_download_data(void* arg) {
+    download_data_flag = true;
+    gpio_intr_disable(GPIO_NUM_6);
+    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+}
+
 // Init INTR
 static esp_err_t interrupt_init(void) {
     // Configure GPIO1 for interrupt
@@ -98,11 +125,11 @@ static esp_err_t interrupt_init(void) {
     };
     esp_err_t ret = gpio_config(&io_conf_1);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO1");
+        ESP_LOGE(TAG, "Failed to configure GPIO1 (Start/Stop Measurements)");
         return ret;
     }
     
-    ESP_LOGI(TAG, "GPIO1 interrupt configured");
+    ESP_LOGI(TAG, "GPIO1 configured - Start/Stop Measurements button");
 
     // Configure GPIO20 for interrupt
     gpio_config_t io_conf_20 = {
@@ -115,11 +142,11 @@ static esp_err_t interrupt_init(void) {
 
     ret = gpio_config(&io_conf_20);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO20");
+        ESP_LOGE(TAG, "Failed to configure GPIO20 (Calibration)");
         return ret;
     }
 
-    ESP_LOGI(TAG, "GPIO20 interrupt configured");
+    ESP_LOGI(TAG, "GPIO20 configured - Calibration button");
 
     // Configure GPIO21 for interrupt
     gpio_config_t io_conf_21 = {
@@ -132,11 +159,11 @@ static esp_err_t interrupt_init(void) {
 
     ret = gpio_config(&io_conf_21);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO21");
+        ESP_LOGE(TAG, "Failed to configure GPIO21 (Read Measurements)");
         return ret;
     }
 
-    ESP_LOGI(TAG, "GPIO21 interrupt configured");
+    ESP_LOGI(TAG, "GPIO21 configured - Read Flash Measurements button");
 
     // Configure GPIO5 for interrupt
     gpio_config_t io_conf_5 = {
@@ -149,11 +176,28 @@ static esp_err_t interrupt_init(void) {
 
     ret = gpio_config(&io_conf_5);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO5");
+        ESP_LOGE(TAG, "Failed to configure GPIO5 (Erase Measurements)");
         return ret;
     }
 
-    ESP_LOGI(TAG, "GPIO5 interrupt configured");
+    ESP_LOGI(TAG, "GPIO5 configured - Erase Flash Measurements button");
+
+    // Configure GPIO6 for interrupt
+    gpio_config_t io_conf_6 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_6),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    ret = gpio_config(&io_conf_6);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure GPIO6 (Download CSV)");
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "GPIO6 configured - Download CSV Data button");
 
     // **INSTALL ISR SERVICE FIRST** - before adding any handlers
     ret = gpio_install_isr_service(0);
@@ -184,6 +228,12 @@ static esp_err_t interrupt_init(void) {
     ret = gpio_isr_handler_add(GPIO_NUM_5, gpio_isr_handler_erase_measurements, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add GPIO5 ISR handler");
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add(GPIO_NUM_6, gpio_isr_handler_download_data, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add GPIO6 ISR handler");
         return ret;
     }
 
@@ -393,8 +443,42 @@ static void count_measurements_in_flash(void) {
     ESP_LOGI(TAG, "Found %lu existing measurements in flash", measurement_count);
 }
 
+// Download all measurements as CSV over serial
+static void download_measurements_csv(void) {
+    ESP_LOGI(TAG, "Starting CSV download of %lu measurements...", measurement_count);
+
+    // Send CSV header with markers for parsing
+    printf("\n===CSV_START===\n");
+    printf("Index,Range_mm,Percentage\n");
+
+    if (measurement_count == 0) {
+        printf("===CSV_END===\n");
+        ESP_LOGI(TAG, "No measurements to download");
+        return;
+    }
+
+    // Send all measurements
+    for (uint32_t i = 0; i < measurement_count; i++) {
+        measurement_t meas;
+        uint32_t addr = MEASUREMENTS_FLASH_ADDR + (i * sizeof(measurement_t));
+
+        esp_err_t ret = flash_read(addr, (uint8_t*)&meas, sizeof(measurement_t));
+        if (ret == ESP_OK) {
+            printf("%lu,%u,%u\n", i + 1, meas.range, meas.percentage);
+        } else {
+            ESP_LOGE(TAG, "Failed to read measurement #%lu during download", i + 1);
+        }
+    }
+
+    printf("===CSV_END===\n");
+    ESP_LOGI(TAG, "CSV download complete. %lu measurements sent.", measurement_count);
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "VL53L0X with Flash Storage");
+    
+    // Log pin assignments at startup
+    log_pin_assignments();
     
     // Initialize flash
     esp_err_t ret = flash_init();
@@ -435,7 +519,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
     ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
     
-    ESP_LOGI(TAG, "I2C initialized");
+    ESP_LOGI(TAG, "I2C initialized on GPIO8 (SDA) and GPIO9 (SCL)");
     vTaskDelay(pdMS_TO_TICKS(100));
     
     // Initialize VL53L0X sensor
@@ -451,6 +535,7 @@ void app_main(void) {
     // Main measurement loop
     while (1) {
         if(calibration_flag){
+                ESP_LOGI(TAG, "Calibration triggered via GPIO20");
                 // Calibrate the sensor
                 find_upper_and_lower();
 
@@ -473,13 +558,21 @@ void app_main(void) {
             }
 
         if(read_measurements_flag){
+            ESP_LOGI(TAG, "Read measurements triggered via GPIO21");
             read_measurements_from_flash();
             read_measurements_flag = false;
         }
 
         if(erase_measurements_flag){
+            ESP_LOGI(TAG, "Erase measurements triggered via GPIO5");
             erase_measurements_from_flash();
             erase_measurements_flag = false;
+        }
+
+        if(download_data_flag){
+            ESP_LOGI(TAG, "CSV download triggered via GPIO6");
+            download_measurements_csv();
+            download_data_flag = false;
         }
 
         if(start_reading_data){

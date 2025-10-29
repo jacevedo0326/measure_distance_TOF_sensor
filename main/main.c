@@ -9,6 +9,7 @@
 #include "vl53l0x.h"
 #include "flash.h"
 #include "config.h"
+#include "bluetooth.h"
 
 static const char *TAG = "MAIN";
 
@@ -502,6 +503,13 @@ void app_main(void) {
     ret = interrupt_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize interrupts!");
+        return;
+    }
+
+    // Initialize Bluetooth
+    ret = bluetooth_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Bluetooth!");
         return;
     }
 

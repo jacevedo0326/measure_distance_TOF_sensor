@@ -68,11 +68,20 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     switch (ctxt->op) {
-    case BLE_GATT_ACCESS_OP_READ_CHR:
+    case BLE_GATT_ACCESS_OP_READ_CHR: {
         ESP_LOGI(TAG, "Read request received");
+        // Send "Hello World!" as response to read request
+        const char *hello = "Hello World!";
+        int rc = os_mbuf_append(ctxt->om, hello, strlen(hello));
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to append data for read response");
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        ESP_LOGI(TAG, "Sent 'Hello World!' as read response");
         return 0;
+    }
 
-    case BLE_GATT_ACCESS_OP_WRITE_CHR:
+    case BLE_GATT_ACCESS_OP_WRITE_CHR: {
         ESP_LOGI(TAG, "Received %d bytes via BLE", OS_MBUF_PKTLEN(ctxt->om));
 
         // Read the received data
@@ -130,6 +139,7 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
         }
 
         return 0;
+    }
 
     default:
         return BLE_ATT_ERR_UNLIKELY;
@@ -171,8 +181,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        ESP_LOGI(TAG, "Subscribe event; cur_notify=%d", event->subscribe.cur_notify);
-        notify_enabled = event->subscribe.cur_notify;
+        ESP_LOGI(TAG, "Subscribe event; cur_notify=%d, cur_indicate=%d",
+                 event->subscribe.cur_notify, event->subscribe.cur_indicate);
+        notify_enabled = (event->subscribe.cur_notify != 0) || (event->subscribe.cur_indicate != 0);
+        ESP_LOGI(TAG, "Notifications/Indications %s", notify_enabled ? "ENABLED" : "DISABLED");
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -372,4 +384,34 @@ esp_err_t bluetooth_send_notification(const uint8_t *data, uint16_t len)
 bool bluetooth_is_connected(void)
 {
     return (conn_handle != BLE_HS_CONN_HANDLE_NONE);
+}
+
+/**
+ * @brief Test Bluetooth connection by sending "Hello World" every 10 seconds
+ */
+void test_bluetooth_connection(void)
+{
+    const char *hello_msg = "Hello World!";
+
+    while (1) {
+        // Check if a device is connected
+        if (bluetooth_is_connected() && notify_enabled) {
+            // Send "Hello World" notification
+            esp_err_t ret = bluetooth_send_notification(
+                (const uint8_t *)hello_msg,
+                strlen(hello_msg)
+            );
+
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "Test: Sent 'Hello World!' to connected device");
+            } else {
+                ESP_LOGW(TAG, "Test: Failed to send notification");
+            }
+        } else {
+            ESP_LOGI(TAG, "Test: No device connected or notifications not enabled, waiting...");
+        }
+
+        // Wait 10 seconds before next transmission
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }

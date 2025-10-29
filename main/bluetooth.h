@@ -55,4 +55,12 @@ esp_err_t bluetooth_send_notification(const uint8_t *data, uint16_t len);
  */
 bool bluetooth_is_connected(void);
 
+/**
+ * @brief Test Bluetooth connection by sending "Hello World" every 10 seconds
+ *
+ * This function runs in a loop and sends "Hello World" notifications
+ * every 10 seconds to verify the Bluetooth connection is working.
+ */
+void test_bluetooth_connection(void);
+
 #endif // BLUETOOTH_H

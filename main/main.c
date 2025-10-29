@@ -537,9 +537,11 @@ void app_main(void) {
     start_continuous(100);  // 100ms period
     
     vTaskDelay(pdMS_TO_TICKS(200));  // Wait for first measurement
-    
+    // Start Bluetooth test
+    ESP_LOGI(TAG, "Starting Bluetooth connection test...");
+    test_bluetooth_connection();
 
-    
+
     // Main measurement loop
     while (1) {
         if(calibration_flag){

@@ -537,15 +537,18 @@ void app_main(void) {
     start_continuous(100);  // 100ms period
     
     vTaskDelay(pdMS_TO_TICKS(200));  // Wait for first measurement
-    // Start Bluetooth test
-    ESP_LOGI(TAG, "Starting Bluetooth connection test...");
-    test_bluetooth_connection();
-
 
     // Main measurement loop
     while (1) {
         if(calibration_flag){
-                ESP_LOGI(TAG, "Calibration triggered via GPIO20");
+                ESP_LOGI(TAG, "Calibration triggered");
+
+                // Send notification if Bluetooth is connected
+                if(bluetooth_is_connected()){
+                    const char *msg = "Calibration started";
+                    bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+                }
+
                 // Calibrate the sensor
                 find_upper_and_lower();
 
@@ -560,6 +563,14 @@ void app_main(void) {
                 uint16_t saved_upper = calib_data[2] | (calib_data[3] << 8);
 
                 ESP_LOGI(TAG, "Calibration from flash - Lower: %d, Upper: %d", saved_lower, saved_upper);
+
+                // Send completion notification if Bluetooth is connected
+                if(bluetooth_is_connected()){
+                    char result_msg[64];
+                    snprintf(result_msg, sizeof(result_msg), "Calibration complete: L=%d U=%d", saved_lower, saved_upper);
+                    bluetooth_send_notification((const uint8_t *)result_msg, strlen(result_msg));
+                }
+
                 calibration_flag = false;
                 start_reading_data = false;
 

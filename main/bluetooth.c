@@ -96,15 +96,10 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             return BLE_ATT_ERR_UNLIKELY;
         }
 
-        // For now, just echo "Hello World!" response
-        // Later this will process commands
+        // Process received commands
         ESP_LOGI(TAG, "Data received: 0x%02X (length: %d)", buf[0], len);
 
-        // Send "Hello World!" response
-        const char *hello = "Hello World!";
-        bluetooth_send_notification((const uint8_t *)hello, strlen(hello));
-
-        // Process commands (Phase 2 will expand this)
+        // Process commands
         if (len > 0) {
             switch (buf[0]) {
             case BLE_CMD_START_STOP:

@@ -14,6 +14,9 @@
 
 static const char *TAG = "BLUETOOTH";
 
+// Callback for received data
+static bluetooth_rx_callback_t rx_callback = NULL;
+
 // UUID definitions for our custom service
 // Service UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E (Nordic UART Service compatible)
 static const ble_uuid128_t gatt_svr_svc_uuid =
@@ -85,7 +88,7 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
         ESP_LOGI(TAG, "Received %d bytes via BLE", OS_MBUF_PKTLEN(ctxt->om));
 
         // Read the received data
-        uint8_t buf[20];
+        uint8_t buf[256];  // Increased buffer size for more flexibility
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
         if (len > sizeof(buf)) {
             len = sizeof(buf);
@@ -96,41 +99,13 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             return BLE_ATT_ERR_UNLIKELY;
         }
 
-        // Process received commands
         ESP_LOGI(TAG, "Data received: 0x%02X (length: %d)", buf[0], len);
 
-        // Process commands
-        if (len > 0) {
-            switch (buf[0]) {
-            case BLE_CMD_START_STOP:
-                ESP_LOGI(TAG, "Command: Start/Stop Measurements");
-                start_reading_data = !start_reading_data;
-                break;
-
-            case BLE_CMD_CALIBRATE:
-                ESP_LOGI(TAG, "Command: Calibrate");
-                calibration_flag = true;
-                break;
-
-            case BLE_CMD_READ_MEAS:
-                ESP_LOGI(TAG, "Command: Read Measurements");
-                read_measurements_flag = true;
-                break;
-
-            case BLE_CMD_ERASE_MEAS:
-                ESP_LOGI(TAG, "Command: Erase Measurements");
-                erase_measurements_flag = true;
-                break;
-
-            case BLE_CMD_DOWNLOAD_CSV:
-                ESP_LOGI(TAG, "Command: Download CSV");
-                download_data_flag = true;
-                break;
-
-            default:
-                ESP_LOGW(TAG, "Unknown command: 0x%02X", buf[0]);
-                break;
-            }
+        // Call the registered callback if available
+        if (rx_callback != NULL) {
+            rx_callback(buf, len);
+        } else {
+            ESP_LOGW(TAG, "No RX callback registered, data ignored");
         }
 
         return 0;
@@ -290,10 +265,13 @@ static int gatt_svr_init(void)
 /**
  * @brief Initialize Bluetooth
  */
-esp_err_t bluetooth_init(void)
+esp_err_t bluetooth_init(bluetooth_rx_callback_t callback)
 {
     int rc;
     ESP_LOGI(TAG, "Initializing Bluetooth...");
+
+    // Store the callback
+    rx_callback = callback;
 
     // Initialize NVS (required for BLE)
     esp_err_t ret = nvs_flash_init();

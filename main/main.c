@@ -13,6 +13,13 @@
 
 static const char *TAG = "MAIN";
 
+// Bluetooth command definitions
+#define BLE_CMD_START_STOP      0x01  // Start/Stop measurements (GPIO1)
+#define BLE_CMD_CALIBRATE       0x14  // Start calibration (20 in decimal - GPIO20)
+#define BLE_CMD_READ_MEAS       0x03  // Read measurements (GPIO21)
+#define BLE_CMD_ERASE_MEAS      0x04  // Erase measurements (GPIO5)
+#define BLE_CMD_DOWNLOAD_CSV    0x05  // Download CSV data (GPIO6)
+
 // Debounce configuration
 #define DEBOUNCE_TIME_MS 1000
 
@@ -259,20 +266,56 @@ static uint16_t convert_to_percentage(uint16_t data) {
 
 // Calibration function
 static void find_upper_and_lower(void) {
-    ESP_LOGI(TAG, "Calibration Starting");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "Please press pedal all the way down");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "Calculating...");
-    lower_bound = read_range_continuous();
-    ESP_LOGI(TAG, "Found Lower Bound: %d", lower_bound);
+    const char *msg;
+    char buffer[64];
 
-    ESP_LOGI(TAG, "Please ensure your foot is not on the pedal");
+    msg = "Calibration Starting";
+    ESP_LOGI(TAG, "%s", msg);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    msg = "Please press pedal all the way down";
+    ESP_LOGI(TAG, "%s", msg);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+    }
     vTaskDelay(pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "Calculating...");
+
+    msg = "Calculating...";
+    ESP_LOGI(TAG, "%s", msg);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+    }
+    lower_bound = read_range_continuous();
+
+    snprintf(buffer, sizeof(buffer), "Found Lower Bound: %d", lower_bound);
+    ESP_LOGI(TAG, "%s", buffer);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)buffer, strlen(buffer));
+    }
+
+    msg = "Please ensure your foot is not on the pedal";
+    ESP_LOGI(TAG, "%s", msg);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    msg = "Calculating...";
+    ESP_LOGI(TAG, "%s", msg);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+    }
     upper_bound = read_range_continuous();
-    ESP_LOGI(TAG, "Found Upper Bound: %d", upper_bound);
-    
+
+    snprintf(buffer, sizeof(buffer), "Found Upper Bound: %d", upper_bound);
+    ESP_LOGI(TAG, "%s", buffer);
+    if(bluetooth_is_connected()) {
+        bluetooth_send_notification((const uint8_t *)buffer, strlen(buffer));
+    }
+
     true_upper_bound = upper_bound - lower_bound;
 }
 
@@ -475,6 +518,42 @@ static void download_measurements_csv(void) {
     ESP_LOGI(TAG, "CSV download complete. %lu measurements sent.", measurement_count);
 }
 
+// Bluetooth data receive callback
+static void bluetooth_data_received(const uint8_t *data, uint16_t len) {
+    if (len > 0) {
+        switch (data[0]) {
+        case BLE_CMD_START_STOP:
+            ESP_LOGI(TAG, "BLE Command: Start/Stop Measurements");
+            start_reading_data = !start_reading_data;
+            break;
+
+        case BLE_CMD_CALIBRATE:
+            ESP_LOGI(TAG, "BLE Command: Calibrate");
+            calibration_flag = true;
+            break;
+
+        case BLE_CMD_READ_MEAS:
+            ESP_LOGI(TAG, "BLE Command: Read Measurements");
+            read_measurements_flag = true;
+            break;
+
+        case BLE_CMD_ERASE_MEAS:
+            ESP_LOGI(TAG, "BLE Command: Erase Measurements");
+            erase_measurements_flag = true;
+            break;
+
+        case BLE_CMD_DOWNLOAD_CSV:
+            ESP_LOGI(TAG, "BLE Command: Download CSV");
+            download_data_flag = true;
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unknown BLE command: 0x%02X", data[0]);
+            break;
+        }
+    }
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "VL53L0X with Flash Storage");
     
@@ -506,8 +585,8 @@ void app_main(void) {
         return;
     }
 
-    // Initialize Bluetooth
-    ret = bluetooth_init();
+    // Initialize Bluetooth with callback
+    ret = bluetooth_init(bluetooth_data_received);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize Bluetooth!");
         return;

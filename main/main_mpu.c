@@ -14,15 +14,33 @@
 
 static const char *TAG = "MAIN_MPU";
 
+// ========================================
+// CONTROL INTERFACE REFERENCE
+// ========================================
+//
+// GPIO PINS:
+//   GPIO20 - Calibrate
+//   GPIO21 - Erase Measurements (hold 3 seconds)
+//   GPIO6  - Start/Stop Measurements
+//   GPIO5  - Download CSV Data
+//
+// BLUETOOTH COMMANDS:
+//   0x01 - Start/Stop Measurements
+//   0x02 - Calibrate
+//   0x03 - Download CSV Data
+//   0x04 - Erase Measurements
+//
+// ========================================
+
 // Bluetooth command definitions
-#define BLE_CMD_START_STOP      0x01  // Start/Stop measurements (GPIO1)
-#define BLE_CMD_CALIBRATE       0x15  // Start calibration (21 in decimal - GPIO21)
-#define BLE_CMD_READ_MEAS       0x03  // Read measurements (GPIO20)
-#define BLE_CMD_ERASE_MEAS      0x04  // Erase measurements (GPIO5)
-#define BLE_CMD_DOWNLOAD_CSV    0x05  // Download CSV data (GPIO6)
+#define BLE_CMD_START_STOP      0x01
+#define BLE_CMD_CALIBRATE       0x02
+#define BLE_CMD_DOWNLOAD_CSV    0x03
+#define BLE_CMD_ERASE_MEAS      0x04
 
 // Debounce configuration
 #define DEBOUNCE_TIME_MS 1000
+#define ERASE_HOLD_TIME_MS 3000  // Hold GPIO21 for 3 seconds to erase
 
 // Flash storage configuration
 #define CALIBRATION_FLASH_ADDR 0x2000
@@ -31,7 +49,7 @@ static const char *TAG = "MAIN_MPU";
 #define MAX_MEASUREMENTS ((FLASH_SIZE_BYTES - MEASUREMENTS_FLASH_ADDR) / sizeof(measurement_t))
 
 // Gyroscope configuration
-#define GYRO_SAMPLE_PERIOD_MS 100  // 100ms = 10Hz sampling rate
+#define GYRO_SAMPLE_PERIOD_MS 50  // 50ms = 20Hz sampling rate (change to 20ms for 50Hz)
 #define GYRO_SAMPLE_PERIOD_S (GYRO_SAMPLE_PERIOD_MS / 1000.0f)
 
 // Calibration configuration - gyro offset averaging
@@ -51,9 +69,12 @@ volatile float current_angle = 0.0f;
 // Global flags for interrupt
 volatile bool start_reading_data = false;
 volatile bool calibration_flag = false;
-volatile bool read_measurements_flag = false;
 volatile bool erase_measurements_flag = false;
 volatile bool download_data_flag = false;
+
+// GPIO21 hold timer for erase functionality
+static esp_timer_handle_t gpio21_hold_timer = NULL;
+static volatile bool gpio21_held = false;
 
 // Measurement storage
 typedef struct {
@@ -70,111 +91,108 @@ static mpu6500_t mpu;
 // Timer handle for debouncing
 static esp_timer_handle_t debounce_timer = NULL;
 
-// Function to log pin assignments
-static void log_pin_assignments(void) {
+// Function to log pin assignments and Bluetooth commands
+static void log_control_interface(void) {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "PIN ASSIGNMENT MAP (GYROSCOPE MODE)");
+    ESP_LOGI(TAG, "   CONTROL INTERFACE");
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "I2C Pins:");
-    ESP_LOGI(TAG, "  GPIO8  - I2C SDA (MPU6500 Data)");
-    ESP_LOGI(TAG, "  GPIO9  - I2C SCL (MPU6500 Clock)");
-    ESP_LOGI(TAG, "----------------------------------------");
-    ESP_LOGI(TAG, "Control Buttons:");
-    ESP_LOGI(TAG, "  GPIO1  - Start/Stop Measurements");
-    ESP_LOGI(TAG, "  GPIO21 - Start Calibration");
-    ESP_LOGI(TAG, "  GPIO20 - Read Flash Measurements");
-    ESP_LOGI(TAG, "  GPIO5  - Erase Flash Measurements");
-    ESP_LOGI(TAG, "  GPIO6  - Download CSV Data");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "GPIO PINS:");
+    ESP_LOGI(TAG, "  GPIO8  - I2C SDA (MPU6500)");
+    ESP_LOGI(TAG, "  GPIO9  - I2C SCL (MPU6500)");
+    ESP_LOGI(TAG, "  GPIO20 - Calibrate");
+    ESP_LOGI(TAG, "  GPIO21 - Erase (Hold 3 seconds)");
+    ESP_LOGI(TAG, "  GPIO6  - Start/Stop Measurements");
+    ESP_LOGI(TAG, "  GPIO5  - Download CSV Data");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "BLUETOOTH COMMANDS:");
+    ESP_LOGI(TAG, "  0x01 - Start/Stop Measurements");
+    ESP_LOGI(TAG, "  0x02 - Calibrate");
+    ESP_LOGI(TAG, "  0x03 - Download CSV Data");
+    ESP_LOGI(TAG, "  0x04 - Erase Measurements");
     ESP_LOGI(TAG, "========================================");
 }
 
 // Debounce timer callback - re-enables the interrupt
 static void debounce_timer_callback(void* arg) {
-    gpio_intr_enable(GPIO_NUM_1);
-    gpio_intr_enable(GPIO_NUM_21);
     gpio_intr_enable(GPIO_NUM_20);
-    gpio_intr_enable(GPIO_NUM_5);
+    gpio_intr_enable(GPIO_NUM_21);
     gpio_intr_enable(GPIO_NUM_6);
+    gpio_intr_enable(GPIO_NUM_5);
 }
 
-// GPIO interrupt handler
-static void IRAM_ATTR gpio_isr_handler_read_measurements(void* arg) {
-    start_reading_data = !start_reading_data;
-    gpio_intr_disable(GPIO_NUM_1);
-    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+// GPIO21 hold timer callback - triggers erase after 3 seconds
+static void gpio21_hold_timer_callback(void* arg) {
+    if (gpio21_held && gpio_get_level(GPIO_NUM_21) == 1) {
+        erase_measurements_flag = true;
+        ESP_LOGI(TAG, "GPIO21 held for 3 seconds - Erase triggered");
+    }
+    gpio21_held = false;
 }
 
-// Initialize debounce timer
-static esp_err_t debounce_timer_init(void) {
-    const esp_timer_create_args_t timer_args = {
+// Initialize timers
+static esp_err_t timers_init(void) {
+    const esp_timer_create_args_t debounce_timer_args = {
         .callback = &debounce_timer_callback,
         .arg = NULL,
         .name = "debounce"
     };
 
-    return esp_timer_create(&timer_args, &debounce_timer);
+    const esp_timer_create_args_t hold_timer_args = {
+        .callback = &gpio21_hold_timer_callback,
+        .arg = NULL,
+        .name = "gpio21_hold"
+    };
+
+    esp_err_t ret = esp_timer_create(&debounce_timer_args, &debounce_timer);
+    if (ret != ESP_OK) return ret;
+
+    return esp_timer_create(&hold_timer_args, &gpio21_hold_timer);
 }
 
-static void IRAM_ATTR gpio_isr_handler_start_calibration(void* arg) {
+// GPIO20 - Calibrate
+static void IRAM_ATTR gpio_isr_handler_calibrate(void* arg) {
     calibration_flag = true;
-    gpio_intr_disable(GPIO_NUM_21);
-    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
-}
-
-static void IRAM_ATTR gpio_isr_handler_read_flash_measurements(void* arg) {
-    read_measurements_flag = true;
     gpio_intr_disable(GPIO_NUM_20);
     esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
 }
 
-static void IRAM_ATTR gpio_isr_handler_erase_measurements(void* arg) {
-    erase_measurements_flag = true;
-    gpio_intr_disable(GPIO_NUM_5);
-    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+// GPIO21 - Erase (hold 3 seconds)
+static void IRAM_ATTR gpio_isr_handler_gpio21(void* arg) {
+    uint32_t gpio_level = gpio_get_level(GPIO_NUM_21);
+
+    if (gpio_level == 1) {
+        // Button pressed - start hold timer
+        gpio21_held = true;
+        esp_timer_start_once(gpio21_hold_timer, ERASE_HOLD_TIME_MS * 1000);
+    } else {
+        // Button released before 3 seconds
+        if (gpio21_held) {
+            esp_timer_stop(gpio21_hold_timer);
+            gpio21_held = false;
+        }
+        gpio_intr_disable(GPIO_NUM_21);
+        esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+    }
 }
 
-static void IRAM_ATTR gpio_isr_handler_download_data(void* arg) {
-    download_data_flag = true;
+// GPIO6 - Start/Stop Measurements
+static void IRAM_ATTR gpio_isr_handler_start_stop(void* arg) {
+    start_reading_data = !start_reading_data;
     gpio_intr_disable(GPIO_NUM_6);
     esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
 }
 
-// Init INTR
+// GPIO5 - Download CSV Data
+static void IRAM_ATTR gpio_isr_handler_download(void* arg) {
+    download_data_flag = true;
+    gpio_intr_disable(GPIO_NUM_5);
+    esp_timer_start_once(debounce_timer, DEBOUNCE_TIME_MS * 1000);
+}
+
+// Init GPIO interrupts
 static esp_err_t interrupt_init(void) {
-    // Configure GPIO1 for interrupt (Start/Stop)
-    gpio_config_t io_conf_1 = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_1),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
-    };
-    esp_err_t ret = gpio_config(&io_conf_1);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO1 (Start/Stop Measurements)");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "GPIO1 configured - Start/Stop Measurements button");
-
-    // Configure GPIO21 for interrupt (Calibration)
-    gpio_config_t io_conf_21 = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_21),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
-    };
-
-    ret = gpio_config(&io_conf_21);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO21 (Calibration)");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "GPIO21 configured - Calibration button");
-
-    // Configure GPIO20 for interrupt (Read Measurements)
+    // Configure GPIO20 - Calibrate
     gpio_config_t io_conf_20 = {
         .pin_bit_mask = (1ULL << GPIO_NUM_20),
         .mode = GPIO_MODE_INPUT,
@@ -183,32 +201,16 @@ static esp_err_t interrupt_init(void) {
         .intr_type = GPIO_INTR_POSEDGE,
     };
 
-    ret = gpio_config(&io_conf_20);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO20 (Read Measurements)");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "GPIO20 configured - Read Flash Measurements button");
-
-    // Configure GPIO5 for interrupt (Erase)
-    gpio_config_t io_conf_5 = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_5),
+    // Configure GPIO21 - Erase (both edges to detect hold)
+    gpio_config_t io_conf_21 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_21),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
+        .intr_type = GPIO_INTR_ANYEDGE,
     };
 
-    ret = gpio_config(&io_conf_5);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO5 (Erase Measurements)");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "GPIO5 configured - Erase Flash Measurements button");
-
-    // Configure GPIO6 for interrupt (Download CSV)
+    // Configure GPIO6 - Start/Stop Measurements
     gpio_config_t io_conf_6 = {
         .pin_bit_mask = (1ULL << GPIO_NUM_6),
         .mode = GPIO_MODE_INPUT,
@@ -217,51 +219,43 @@ static esp_err_t interrupt_init(void) {
         .intr_type = GPIO_INTR_POSEDGE,
     };
 
+    // Configure GPIO5 - Download CSV
+    gpio_config_t io_conf_5 = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_5),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    esp_err_t ret = gpio_config(&io_conf_20);
+    if (ret != ESP_OK) return ret;
+
+    ret = gpio_config(&io_conf_21);
+    if (ret != ESP_OK) return ret;
+
     ret = gpio_config(&io_conf_6);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure GPIO6 (Download CSV)");
-        return ret;
-    }
+    if (ret != ESP_OK) return ret;
 
-    ESP_LOGI(TAG, "GPIO6 configured - Download CSV Data button");
+    ret = gpio_config(&io_conf_5);
+    if (ret != ESP_OK) return ret;
 
-    // **INSTALL ISR SERVICE FIRST** - before adding any handlers
+    // Install ISR service
     ret = gpio_install_isr_service(0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to install GPIO ISR service");
-        return ret;
-    }
+    if (ret != ESP_OK) return ret;
 
-    // Now add interrupt handlers
-    ret = gpio_isr_handler_add(GPIO_NUM_1, gpio_isr_handler_read_measurements, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add GPIO1 ISR handler");
-        return ret;
-    }
+    // Add interrupt handlers
+    ret = gpio_isr_handler_add(GPIO_NUM_20, gpio_isr_handler_calibrate, NULL);
+    if (ret != ESP_OK) return ret;
 
-    ret = gpio_isr_handler_add(GPIO_NUM_21, gpio_isr_handler_start_calibration, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add GPIO21 ISR handler");
-        return ret;
-    }
+    ret = gpio_isr_handler_add(GPIO_NUM_21, gpio_isr_handler_gpio21, NULL);
+    if (ret != ESP_OK) return ret;
 
-    ret = gpio_isr_handler_add(GPIO_NUM_20, gpio_isr_handler_read_flash_measurements, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add GPIO20 ISR handler");
-        return ret;
-    }
+    ret = gpio_isr_handler_add(GPIO_NUM_6, gpio_isr_handler_start_stop, NULL);
+    if (ret != ESP_OK) return ret;
 
-    ret = gpio_isr_handler_add(GPIO_NUM_5, gpio_isr_handler_erase_measurements, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add GPIO5 ISR handler");
-        return ret;
-    }
-
-    ret = gpio_isr_handler_add(GPIO_NUM_6, gpio_isr_handler_download_data, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add GPIO6 ISR handler");
-        return ret;
-    }
+    ret = gpio_isr_handler_add(GPIO_NUM_5, gpio_isr_handler_download, NULL);
+    if (ret != ESP_OK) return ret;
 
     return ESP_OK;
 }
@@ -340,33 +334,7 @@ static void calibrate_gyroscope(void) {
 
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // DIAGNOSTIC: Show all 3 axes to help user identify correct axis
-    msg = "DIAGNOSTIC: Move pedal and watch which axis changes most";
-    ESP_LOGI(TAG, "%s", msg);
-    if(bluetooth_is_connected()) {
-        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
-    }
-
-    for (int i = 0; i < 50; i++) {  // 5 seconds of diagnostic data
-        mpu6500_scaled_data_t gyro;
-        if (mpu6500_read_gyro(&mpu, &gyro) == ESP_OK) {
-            float corrected_x = gyro.x - gyro_offset_x;
-            float corrected_y = gyro.y - gyro_offset_y;
-            float corrected_z = gyro.z - gyro_offset_z;
-
-            ESP_LOGI(TAG, "Gyro: X=%.2f  Y=%.2f  Z=%.2f deg/s",
-                     corrected_x, corrected_y, corrected_z);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    msg = "Move pedal one more time and note the axis!";
-    ESP_LOGI(TAG, "%s", msg);
-    if(bluetooth_is_connected()) {
-        bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     // Step 2: Calibrate min angle (pedal fully released)
     msg = "Step 2: Ensure pedal is FULLY RELEASED";
@@ -431,15 +399,16 @@ static void calibrate_gyroscope(void) {
     for (int i = 0; i < 100; i++) {  // 100 samples * 100ms = 10 seconds
         mpu6500_scaled_data_t gyro;
         if (mpu6500_read_gyro(&mpu, &gyro) == ESP_OK) {
-            // Remove offset and integrate
-            // CHANGED: Using X-axis instead of Y-axis based on diagnostic data
             float corrected_gyro_x = gyro.x - gyro_offset_x;
             temp_angle += corrected_gyro_x * GYRO_SAMPLE_PERIOD_S;
 
-            // Show progress every second
-            if (i % 10 == 0) {
-                ESP_LOGI(TAG, "Current angle: %.2f deg, Gyro rate: %.2f deg/s",
-                         temp_angle, corrected_gyro_x);
+            // Show progress every 2 seconds
+            if (i % 20 == 0) {
+                snprintf(buffer, sizeof(buffer), "Angle: %.1f deg", temp_angle);
+                ESP_LOGI(TAG, "%s", buffer);
+                if(bluetooth_is_connected()) {
+                    bluetooth_send_notification((const uint8_t *)buffer, strlen(buffer));
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(GYRO_SAMPLE_PERIOD_MS));
@@ -702,28 +671,23 @@ static void bluetooth_data_received(const uint8_t *data, uint16_t len) {
     if (len > 0) {
         switch (data[0]) {
         case BLE_CMD_START_STOP:
-            ESP_LOGI(TAG, "BLE Command: Start/Stop Measurements");
             start_reading_data = !start_reading_data;
+            ESP_LOGI(TAG, "BLE: %s measurements", start_reading_data ? "Started" : "Stopped");
             break;
 
         case BLE_CMD_CALIBRATE:
-            ESP_LOGI(TAG, "BLE Command: Calibrate");
             calibration_flag = true;
-            break;
-
-        case BLE_CMD_READ_MEAS:
-            ESP_LOGI(TAG, "BLE Command: Read Measurements");
-            read_measurements_flag = true;
-            break;
-
-        case BLE_CMD_ERASE_MEAS:
-            ESP_LOGI(TAG, "BLE Command: Erase Measurements");
-            erase_measurements_flag = true;
+            ESP_LOGI(TAG, "BLE: Calibration started");
             break;
 
         case BLE_CMD_DOWNLOAD_CSV:
-            ESP_LOGI(TAG, "BLE Command: Download CSV");
             download_data_flag = true;
+            ESP_LOGI(TAG, "BLE: CSV download started");
+            break;
+
+        case BLE_CMD_ERASE_MEAS:
+            erase_measurements_flag = true;
+            ESP_LOGI(TAG, "BLE: Erasing measurements");
             break;
 
         default:
@@ -734,10 +698,12 @@ static void bluetooth_data_received(const uint8_t *data, uint16_t len) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "MPU6500 Gyroscope Pedal Position Tracker");
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "MPU6500 Pedal Position Tracker");
+    ESP_LOGI(TAG, "========================================");
 
-    // Log pin assignments at startup
-    log_pin_assignments();
+    // Log control interface at startup
+    log_control_interface();
 
     // Initialize flash
     esp_err_t ret = flash_init();
@@ -750,10 +716,10 @@ void app_main(void) {
     load_calibration_from_flash();
     count_measurements_in_flash();
 
-    // Initialize debounce timer
-    ret = debounce_timer_init();
+    // Initialize timers
+    ret = timers_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize debounce timer!");
+        ESP_LOGE(TAG, "Failed to initialize timers!");
         return;
     }
 
@@ -809,66 +775,47 @@ void app_main(void) {
     // Main measurement loop
     while (1) {
         if(calibration_flag) {
-            ESP_LOGI(TAG, "Calibration triggered");
-
-            // Send notification if Bluetooth is connected
-            if(bluetooth_is_connected()) {
-                const char *msg = "Calibration started";
-                bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
-            }
-
-            // Calibrate the gyroscope
+            ESP_LOGI(TAG, "Starting calibration...");
             calibrate_gyroscope();
-
-            // Save calibration to flash
             save_calibration_to_flash();
 
-            // Send completion notification if Bluetooth is connected
             if(bluetooth_is_connected()) {
-                char result_msg[128];
-                snprintf(result_msg, sizeof(result_msg),
-                         "Calibration complete: Range %.1f to %.1f deg",
-                         min_angle, max_angle);
-                bluetooth_send_notification((const uint8_t *)result_msg, strlen(result_msg));
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Cal done: %.0f to %.0f deg", min_angle, max_angle);
+                bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
             }
 
             calibration_flag = false;
             start_reading_data = false;
-
-            // Reset measurement count when recalibrating
             measurement_count = 0;
         }
 
-        if(read_measurements_flag) {
-            ESP_LOGI(TAG, "Read measurements triggered via GPIO20");
-            read_measurements_from_flash();
-            read_measurements_flag = false;
-        }
-
         if(erase_measurements_flag) {
-            ESP_LOGI(TAG, "Erase measurements triggered via GPIO5");
+            ESP_LOGI(TAG, "Erasing all measurements...");
             erase_measurements_from_flash();
+
+            if(bluetooth_is_connected()) {
+                const char *msg = "Measurements erased";
+                bluetooth_send_notification((const uint8_t *)msg, strlen(msg));
+            }
+
             erase_measurements_flag = false;
         }
 
         if(download_data_flag) {
-            ESP_LOGI(TAG, "CSV download triggered via GPIO6");
+            ESP_LOGI(TAG, "Downloading CSV data...");
             download_measurements_csv();
             download_data_flag = false;
         }
 
         if(start_reading_data) {
-            // Read gyroscope data
             mpu6500_scaled_data_t gyro;
             if (mpu6500_read_gyro(&mpu, &gyro) == ESP_OK) {
-                // Remove offset and integrate angular velocity
-                // CHANGED: Using X-axis instead of Y-axis based on diagnostic data
+                // Integrate angular velocity
                 float corrected_gyro_x = gyro.x - gyro_offset_x;
-                float angle_delta = corrected_gyro_x * GYRO_SAMPLE_PERIOD_S;
-                float unclamped_angle = current_angle + angle_delta;
-                current_angle += angle_delta;
+                current_angle += corrected_gyro_x * GYRO_SAMPLE_PERIOD_S;
 
-                // Clamp to calibrated range to prevent drift
+                // Clamp to calibrated range
                 bool reversed = (min_angle > max_angle);
                 float actual_min = reversed ? max_angle : min_angle;
                 float actual_max = reversed ? min_angle : max_angle;
@@ -879,14 +826,10 @@ void app_main(void) {
                 // Convert to percentage
                 uint8_t percentage = convert_to_percentage(current_angle);
 
-                ESP_LOGI(TAG, "Gyro: %.2f deg/s, Delta: %.2f deg, Unclamped: %.2f, Angle: %.2f deg (range: %.2f to %.2f), %%: %d%%",
-                         corrected_gyro_x, angle_delta, unclamped_angle, current_angle,
-                         actual_min, actual_max, percentage);
+                ESP_LOGI(TAG, "Angle: %.1f deg, Percentage: %d%%", current_angle, percentage);
 
                 // Save measurement to flash
                 save_measurement(current_angle, percentage);
-            } else {
-                ESP_LOGE(TAG, "Failed to read gyroscope data");
             }
         }
 
